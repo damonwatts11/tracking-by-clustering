@@ -10,7 +10,7 @@ def resolve_collisions(centers: np.ndarray, velocities: np.ndarray,
     r   = cfg.radius
     K   = cfg.n_spheres
     e = cfg.elasticity
-    new_velocities = velocities.copy()
+    velocity_deltas = np.zeros_like(velocities)
     
     for i, j in combinations(range(K), 2):
         
@@ -19,16 +19,12 @@ def resolve_collisions(centers: np.ndarray, velocities: np.ndarray,
         if dist >= 2 * r:
             continue
 
-        normal_vect= delta / dist
-        
-        rel_normal = np.dot(new_velocities[i] - new_velocities[j], normal_vect)
+        normal_vect = delta / dist
+        rel_normal = np.dot(velocities[i] - velocities[j], normal_vect)
         if rel_normal <= 0:
             continue                                         
-
         
-        dv = rel_normal * normal_vect
-        new_velocities[i] = new_velocities[i] - e * dv
-        new_velocities[j] = new_velocities[j] + e * dv
-
-    return new_velocities
-    
+        dv = e * rel_normal * normal_vect
+        velocity_deltas[i] -= dv
+        velocity_deltas[j] += dv
+    return velocities + velocity_deltas
