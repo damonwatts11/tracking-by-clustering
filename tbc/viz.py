@@ -129,15 +129,32 @@ def animate_world(traj: Trajectory, cfg: SimConfig) -> go.Figure:
     L = cfg.cube_size
 
     frames = []
+    margin = cfg.radius          # how far outside the box a ghost is still drawn
     for t in range(T):
+        base = traj.centers[t]   # (K, 2)
+        xs = list(base[:, 0])
+        ys = list(base[:, 1])
+        cs = [COLORS[k % len(COLORS)] for k in range(cfg.n_spheres)]
+
+        # ghost copies: same sphere shifted by ±L, kept only near the box
+        for k in range(cfg.n_spheres):
+            for dx in (-L, 0, L):
+                for dy in (-L, 0, L):
+                    if dx == 0 and dy == 0:
+                        continue
+                    gx, gy = base[k, 0] + dx, base[k, 1] + dy
+                    if -margin < gx < L + margin and -margin < gy < L + margin:
+                        xs.append(gx)
+                        ys.append(gy)
+                        cs.append(COLORS[k % len(COLORS)])
+
         frames.append(go.Frame(
             data=[go.Scatter(
-                x=traj.centers[t, :, 0],
-                y=traj.centers[t, :, 1],
+                x=xs, y=ys,
                 mode="markers",
                 marker=dict(
                     size=14,
-                    color=COLORS[:cfg.n_spheres],
+                    color=cs,
                     line=dict(width=1, color="white"),
                 ),
             )],
@@ -159,19 +176,18 @@ def animate_world(traj: Trajectory, cfg: SimConfig) -> go.Figure:
                     dict(label="▶ Play",
                          method="animate",
                          args=[None, dict(frame=dict(duration=100, redraw=True),
+                                          transition=dict(duration=0),
                                           fromcurrent=True)]),
                     dict(label="⏸ Pause",
                          method="animate",
                          args=[[None], dict(frame=dict(duration=0, redraw=False),
                                             mode="immediate")]),
                 ],
-            )],
-            sliders=[dict(
+
+            )], sliders=[dict(
                 steps=[dict(method="animate", args=[[str(t)],
                             dict(mode="immediate", frame=dict(duration=0, redraw=True))],
                             label=str(t)) for t in range(T)],
                 x=0, y=0, len=1.0,
-            )],
-        ),
-    )
+            )],),)
     return fig
