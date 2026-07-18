@@ -1,7 +1,35 @@
+# Python
 __pycache__/
-.ipynb_checkpoints/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
 .venv/
-data/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Generated data & figures
 *.npz
-*.pyc
+*.npy
+figures/
+outputs/
+results/
+
+# VS Code
+.vscode/
+
+# macOS
 .DS_Store
+
+# Misc
+*.log
+.cache/
