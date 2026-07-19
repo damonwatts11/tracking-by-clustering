@@ -20,6 +20,7 @@ import plotly.graph_objects as go
 
 from tbc.synthesis import SimConfig, generate_dataset
 from tbc.instance import build_instance
+from tbc.gating import build_instance_adaptive, estimate_gates_from_dataset
 from tbc.solver import greedy_solve
 from tbc.viz import COLORS, animate_world
 from tbc.viz_report import (partition_metrics, large_tracks, _circular_mean,
@@ -51,14 +52,39 @@ onoise = sb.select_slider("observation noise σ_obs",
 seed   = sb.number_input("seed", 0, 999, 0)
 
 sb.title("Instance (gates)")
-auto = sb.checkbox("auto gates (ρ_in = 4σ+0.05, ρ_mot = v·dt+4σ+0.1)", value=True)
-if auto:
+gate_mode = sb.radio(
+    "gate mode",
+    ["adaptive (med + c·MAD, data-driven)",
+     "formula (4σ — needs sim params)",
+     "manual sliders"],
+    index=0,
+    help="adaptive: gates estimated from the point cloud itself via robust "
+         "nearest-neighbour statistics — no simulation parameters needed, "
+         "so it also works on real (non-synthetic) clouds.")
+
+if gate_mode.startswith("adaptive"):
+    c_gate = sb.slider("c_gate (edge admission, recall)", 1.0, 6.0, 3.0, 0.5,
+                       help="ρ_gate = med + c_gate·MAD. Generous: the gate "
+                            "must not drop true edges.")
+    c_cost = sb.slider("c_cost (cost zero-crossing)", 0.0, 3.0, 0.5, 0.25,
+                       help="ρ_cost = med + c_cost·MAD. Edges with "
+                            "ρ_cost < d < ρ_gate get NEGATIVE cost "
+                            "(repulsive evidence for GAEC).")
+    min_nb = sb.slider("min neighbours (noise pre-filter)", 0, 8, 3,
+                       help="Points with fewer neighbours than this inside "
+                            "ρ_gate in their own frame are excluded from the "
+                            "graph (kept as singletons). 0 = off.")
+    c_cost = min(c_cost, c_gate)          # cost zero must lie inside the gate
+    gate_key = ("adaptive", c_gate, c_cost, min_nb)
+elif gate_mode.startswith("formula"):
     rho_in  = 4 * onoise + 0.05
     rho_mot = speed * dt + 4 * onoise + 0.1
     sb.caption(f"ρ_in = {rho_in:.2f}   ρ_mot = {rho_mot:.2f}")
+    gate_key = ("fixed", rho_in, rho_mot)
 else:
     rho_in  = sb.slider("ρ_in", 0.05, 2.0, float(4 * onoise + 0.05), 0.05)
     rho_mot = sb.slider("ρ_mot", 0.05, 2.5, float(speed * dt + 4 * onoise + 0.1), 0.05)
+    gate_key = ("fixed", rho_in, rho_mot)
 
 run_tracker = sb.toggle("run GAEC tracker", value=False)
 
@@ -79,14 +105,28 @@ def get_dataset(p):
 
 
 @st.cache_data(show_spinner="building the instance graph ...")
-def get_instance(p, ri, rm):
+def get_instance(p, gkey):
     ds = get_dataset(p)
+    if gkey[0] == "adaptive":
+        _, cg, cc, mn = gkey
+        return build_instance_adaptive(
+            ds, c_gate_spatial=cg, c_gate_motion=cg,
+            c_cost_spatial=cc, c_cost_motion=cc,
+            min_neighbors=(mn if mn > 0 else None),
+            cyclic=False, verbose=False)
+    _, ri, rm = gkey
     return build_instance(ds, ri, rm, cyclic=False, verbose=False)
 
 
+@st.cache_data(show_spinner="estimating gates from the cloud ...")
+def get_estimated_gates(p, cg):
+    ds = get_dataset(p)
+    return estimate_gates_from_dataset(ds, c_spatial=cg, c_motion=cg)
+
+
 @st.cache_data(show_spinner="running GAEC on the full spacetime graph ...")
-def get_solution(p, ri, rm):
-    inst = get_instance(p, ri, rm)
+def get_solution(p, gkey):
+    inst = get_instance(p, gkey)
     ds = get_dataset(p)
     t0 = time.perf_counter()
     labels, objective = greedy_solve(inst)
@@ -97,8 +137,13 @@ def get_solution(p, ri, rm):
 
 
 ds = get_dataset(params)
-inst = get_instance(params, rho_in, rho_mot)
+inst = get_instance(params, gate_key)
 cfg = ds.config
+
+if gate_key[0] == "adaptive":
+    _rs, _rm = get_estimated_gates(params, gate_key[1])
+    sb.caption(f"estimated from data:  ρ_gate,in = {_rs:.3f}   "
+               f"ρ_gate,mot = {_rm:.3f}")
 
 # ------------------------------------------------------------------
 # Header
@@ -283,7 +328,7 @@ if not run_tracker:
     st.info("Toggle **run GAEC tracker** in the sidebar. First run takes a few "
             "seconds to minutes depending on size; results are cached.")
 else:
-    labels_pred, objective, rt, met = get_solution(params, rho_in, rho_mot)
+    labels_pred, objective, rt, met = get_solution(params, gate_key)
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("VI (inliers)", f"{met['vi']:.3f}")
@@ -383,7 +428,7 @@ with tab1:
     if not run_tracker:
         st.info("Run the GAEC tracker (sidebar toggle) to see per-run metrics.")
     else:
-        labels_pred, objective, rt, met = get_solution(params, rho_in, rho_mot)
+        labels_pred, objective, rt, met = get_solution(params, gate_key)
 
         st.subheader("Cluster size distribution")
         _, counts = np.unique(labels_pred, return_counts=True)
@@ -455,9 +500,17 @@ with tab4:
                 kw[var] = v
                 c = SimConfig(**kw)
                 d = generate_dataset(c)
-                ri = 4 * c.obs_noise_std + 0.05
-                rm = c.speed * c.dt + 4 * c.obs_noise_std + 0.1
-                ins = build_instance(d, ri, rm, cyclic=False, verbose=False)
+                if gate_key[0] == "adaptive":
+                    _, cg_, cc_, mn_ = gate_key
+                    ins = build_instance_adaptive(
+                        d, c_gate_spatial=cg_, c_gate_motion=cg_,
+                        c_cost_spatial=cc_, c_cost_motion=cc_,
+                        min_neighbors=(mn_ if mn_ > 0 else None),
+                        cyclic=False, verbose=False)
+                else:
+                    ri = 4 * c.obs_noise_std + 0.05
+                    rm = c.speed * c.dt + 4 * c.obs_noise_std + 0.1
+                    ins = build_instance(d, ri, rm, cyclic=False, verbose=False)
                 t0 = time.perf_counter()
                 lab, _ = greedy_solve(ins)
                 rt_ = time.perf_counter() - t0
