@@ -42,7 +42,7 @@ class UnionFind:
 # Task 7 — Unified GAEC on the full graph (heap-based, fast)
 # =============================================================
 
-def gaec(instance) -> np.ndarray:
+def gaec(inst) -> np.ndarray:
     """
     Greedy Additive Edge Contraction on the ENTIRE graph at once.
 
@@ -53,97 +53,46 @@ def gaec(instance) -> np.ndarray:
         labels : (M,) int array — track id per point
     """
 
-    n     = instance.n_nodes
-    edges = instance.edges   # (E, 2)
-    costs = instance.costs   # (E,)
-
+    n, edges, costs = inst.n_nodes, inst.edges, inst.costs
     uf = UnionFind(n)
-
-    # join_cost[(a,b)] = summed cost of all edges between cluster a and b
-    # Always stored as (min_root, max_root) → one entry per pair
-    join_cost = defaultdict(float)
-
-    # Build initial join costs from all positive edges
+    join = defaultdict(float)
+    adj = defaultdict(set)                       # root -> vecinos (roots)
     for idx in range(len(edges)):
-        c = costs[idx]
-        if c <= 0:
-            continue
         i, j = int(edges[idx, 0]), int(edges[idx, 1])
-        ri, rj = uf.find(i), uf.find(j)
-        if ri == rj:
-            continue
-        key = (min(ri, rj), max(ri, rj))
-        join_cost[key] += c
-
-    # Max-heap: Python's heapq is a min-heap, so we push negative costs
-    # Each entry: (-cost, a, b)
-    # We use lazy deletion: entries become stale after merges, we skip them
-    heap = []
-    for (a, b), val in join_cost.items():
-        heapq.heappush(heap, (-val, a, b))
-
-    # Greedy merge loop
+        key = (min(i, j), max(i, j))
+        join[key] += float(costs[idx])
+        adj[i].add(j); adj[j].add(i)
+    heap = [(-v, a, b) for (a, b), v in join.items() if v > 0]
+    heapq.heapify(heap)
     while heap:
-        neg_val, a, b = heapq.heappop(heap)
-        val = -neg_val
-
-        if val <= 0:
-            break   # heap is sorted; nothing better remains
-
-        # Find current roots (they may have changed)
-        ra = uf.find(a)
-        rb = uf.find(b)
-
-        if ra == rb:
-            continue   # stale entry — already merged
-
-        # Check if the stored cost is still current
+        nv, a, b = heapq.heappop(heap)
+        v = -nv
+        if v <= 0: break
+        ra, rb = uf.find(a), uf.find(b)
+        if ra == rb: continue
         key = (min(ra, rb), max(ra, rb))
-        if key not in join_cost:
-            continue   # stale
-        if abs(join_cost[key] - val) > 1e-9:
-            # The cost changed since this heap entry was pushed — re-push
-            # the current value and skip this stale entry
-            heapq.heappush(heap, (-join_cost[key], key[0], key[1]))
+        if key not in join or abs(join[key] - v) > 1e-9:
+            if key in join and join[key] > 0:
+                heapq.heappush(heap, (-join[key], key[0], key[1]))
             continue
-
-        # Remove from dict — we're processing this merge now
-        del join_cost[key]
-
-        # Perform the merge
+        del join[key]
         new_root = uf.union(ra, rb)
         old_root = rb if new_root == ra else ra
-
-        # Fold old_root's connections into new_root
-        # Collect all keys involving old_root
-        affected = [k for k in list(join_cost.keys())
-                    if k[0] == old_root or k[1] == old_root]
-
-        for k in affected:
-            x, y = k
-            neighbor = y if x == old_root else x
-            nb_root = uf.find(neighbor)
-
-            old_val = join_cost.pop(k)
-
-            if nb_root == new_root:
-                # Neighbor is now inside the merged cluster — discard
-                continue
-
-            new_key = (min(new_root, nb_root), max(new_root, nb_root))
-            join_cost[new_key] += old_val
-
-            # Push updated entry to heap (lazy: old entries become stale)
-            if join_cost[new_key] > 0:
-                heapq.heappush(heap, (-join_cost[new_key], new_key[0], new_key[1]))
-            else:
-                # Negative accumulated cost — remove so it's never selected
-                del join_cost[new_key]
-
-    # Extract labels: map root ids → clean 0-indexed track ids
-    raw_labels = np.array([uf.find(i) for i in range(n)])
-    _, inverse  = np.unique(raw_labels, return_inverse=True)
-    return inverse
+        adj[new_root].discard(old_root); adj[old_root].discard(new_root)
+        for nb in adj.pop(old_root, ()):         # plegar SOLO vecinos de old_root
+            k = (min(old_root, nb), max(old_root, nb))
+            if k not in join: continue
+            val = join.pop(k)
+            adj[nb].discard(old_root)
+            nbr = uf.find(nb)
+            if nbr == new_root: continue
+            nk = (min(new_root, nbr), max(new_root, nbr))
+            join[nk] += val
+            adj[new_root].add(nbr); adj[nbr].add(new_root)
+            if join[nk] > 0:
+                heapq.heappush(heap, (-join[nk], nk[0], nk[1]))
+    raw = np.array([uf.find(i) for i in range(n)])
+    return np.unique(raw, return_inverse=True)[1]
 
 
 # =============================================================

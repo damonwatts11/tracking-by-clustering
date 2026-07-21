@@ -18,11 +18,11 @@ Classical tracking pipelines detect objects per frame, then link detections over
 The full pipeline:
 
 1. **Synthesis** — simulate K spheres moving on a 2D torus (periodic boundaries) with elastic collisions, then generate noisy point-cloud observations plus background clutter.
-2. **Instance construction** — build a graph over all observed points: within-frame edges and between-frame edges, each with a signed real-valued cost.
+2. **Instance construction** — build a graph over all observed points: within-frame and between-frame edges. Gate radii and edge-cost thresholds are **estimated from the data** (robust `median + c·MAD` statistics), and each edge gets a **signed** cost — positive rewards joining, negative penalises it.
 3. **Solver** — cluster the graph with a heap-based GAEC (a greedy heuristic for the minimum-cost multicut / correlation-clustering problem). Each resulting cluster is one recovered track.
 4. **Evaluation** — compare predicted clusters against ground-truth identities using **Variation of Information (VI)**, plus ARI/NMI as supporting metrics, across motion models, noise levels, and seeds.
 
-At the default configuration (4 spheres, 60 frames, 20 inliers/sphere, 50 background points/frame) the pipeline handles **~7,800 nodes** and **~145,000 edges** in a single GAEC pass.
+At the default configuration (4 spheres, 60 frames, 20 inliers/sphere, 50 background points/frame) the pipeline handles **~7,800 nodes**. A DBSCAN-style pre-filter drops the isolated clutter (~3,000 points at defaults) before edges are built, leaving roughly **1.1×10⁵ edges** for a single GAEC pass.
 
 ---
 
@@ -35,15 +35,13 @@ tracking-by-clustering/
 │   ├── geometry.py          # torus math: wrap, minimum-image displacement, torus distance
 │   ├── motion.py            # initial states, motion step, Trajectory, simulate()
 │   ├── collision.py         # elastic sphere–sphere collision resolution
-│   ├── observation.py       # noisy inlier sampling + uniform background clutter
+│   ├── observation.py       # noisy inlier sampling + uniform background clutter (label -1)
 │   ├── synthesis.py         # SimConfig, SyntheticDataset, generate/save/load dataset
-│   ├── instance.py          # TrackingInstance, gating, edge costs, build_instance()
+│   ├── instance.py          # robust MAD gates, noise pre-filter, signed costs, build_instance()
 │   ├── solver.py            # UnionFind, gaec(), greedy_solve(), variation_of_information()
 │   ├── viz.py               # basic animation / world visualisation
 │   └── viz_report.py        # report-grade figures (noise curves, heatmaps, panels, …)
-├── main.ipynb               # end-to-end walkthrough of all four steps
 ├── app.py                   # interactive Streamlit explorer
-├── VIZ_TODO.md              # prioritised visualization plan for the final talk
 └── README.md
 ```
 
@@ -56,10 +54,10 @@ Requirements: Python ≥ 3.10.
 ```bash
 git clone https://github.com/damonwatts11/tracking-by-clustering.git
 cd tracking-by-clustering
-pip install numpy matplotlib plotly streamlit jupyter
+pip install -r requirements.txt
 ```
 
-No compiled dependencies and **no external solver** (see §8 on Gurobi).
+Dependencies: `numpy`, `scipy` (torus-aware nearest-neighbour gating), `plotly`, `streamlit`, `jupyter`/`ipykernel`. No compiled extensions and **no external solver** (see §8 on Gurobi).
 
 ---
 
@@ -72,23 +70,21 @@ from tbc.synthesis import SimConfig, generate_dataset
 from tbc.instance  import build_instance
 from tbc.solver    import greedy_solve, variation_of_information
 
-cfg = SimConfig(n_spheres=4, n_timesteps=60, obs_noise_std=0.1, seed=0)
-ds  = generate_dataset(cfg)
+cfg  = SimConfig(n_spheres=4, n_timesteps=60, obs_noise_std=0.1, seed=0)
+ds   = generate_dataset(cfg)
 
-# gates: ρ_in from observation noise, ρ_mot from max per-frame displacement
-rho_in  = 4 * cfg.obs_noise_std + 0.05
-rho_mot = cfg.speed * cfg.dt + 4 * cfg.obs_noise_std + 0.1
-
-inst        = build_instance(ds, rho_in=rho_in, rho_mot=rho_mot)
+# gates and cost thresholds are estimated from the point cloud itself;
+# the only knobs are the dimensionless c_gate / c_cost multipliers.
+inst        = build_instance(ds)          # defaults: c_gate=3, c_cost=2, min_neighbors=3
 labels_pred = greedy_solve(inst)
 
-vi = variation_of_information(ds.labels, labels_pred)
+# VI is reported on inliers only (ground-truth label >= 0; background is -1)
+mask = ds.labels >= 0
+vi   = variation_of_information(ds.labels[mask], labels_pred[mask])
 print(f"VI = {vi:.4f}")   # 0.0 = perfect recovery
 ```
 
 ### Notebook
-
-`main.ipynb` walks through all four steps with intermediate outputs and figures.
 
 ### Interactive explorer
 
@@ -96,7 +92,7 @@ print(f"VI = {vi:.4f}")   # 0.0 = perfect recovery
 streamlit run app.py
 ```
 
-The app exposes every `SimConfig` parameter and both gate radii in the sidebar, and provides five synchronized views: animated ground-truth world, radar-vs-truth point clouds, the gated instance graph between consecutive frames, the GAEC tracking result with per-track bounding circles, and evaluation tabs (per-run metrics, edge quality, noise sweep).
+The app exposes every `SimConfig` parameter plus the gate controls (`c_gate`, `c_cost`, and the noise pre-filter's `min neighbours`) in the sidebar, and provides synchronized views: animated ground-truth world, radar-vs-truth point clouds, the gated instance graph between consecutive frames, the GAEC tracking result with per-track bounding circles, and evaluation tabs (per-run metrics, edge quality, noise sweep).
 
 ---
 
@@ -107,9 +103,9 @@ The app exposes every `SimConfig` parameter and both gate radii in the sidebar, 
 - **World:** a square `[0, L)²` with periodic boundaries — topologically a **2D torus**. All distances use the minimum-image convention (`torus_distance`), so an object leaving the right edge re-enters on the left, and distance is measured "the short way around".
 - **Motion models:**
   - _Ballistic_ (`motion_noise_std = 0.0`) — constant velocity between collisions.
-  - _Random walk_ (`motion_noise_std > 0`, default 0.1) — Gaussian velocity perturbations each step.
+  - _Random walk_ (`motion_noise_std > 0`, default 0.05) — Gaussian velocity perturbations each step.
 - **Collisions:** elastic sphere–sphere collisions (`elasticity = 1.0` by default) resolved on the torus.
-- **Observations:** per frame, each sphere emits `n_inliers_per_sphere` points drawn from a Gaussian around its center (`obs_noise_std`), plus `n_background` uniformly distributed clutter points labeled as background.
+- **Observations:** per frame, each sphere emits `n_inliers_per_sphere` points drawn from a Gaussian around its center (`obs_noise_std`) and labeled `k`; plus `n_background` uniformly distributed clutter points labeled `-1`.
 - **Reproducibility:** everything is driven by a single `seed` through `np.random.default_rng`; datasets can be saved/loaded as compressed `.npz` with the full config embedded.
 
 All parameters live in one dataclass:
@@ -131,18 +127,25 @@ All parameters live in one dataclass:
 
 ### Step 2 — Instance construction (`instance.py`)
 
-- **Nodes:** every observed point across all frames (default run: ~7,800).
-- **Within-frame edges** (~46,400): all pairs in the same frame with torus distance `d < ρ_in` (spatial gate).
-- **Between-frame edges** (~98,700): all pairs in consecutive frames with `d < ρ_mot` (motion gate), including **cyclic wrap edges** between the last and first frame (the spacetime domain (x, y, t) is a 3-torus).
-- **Edge costs** use a linear log-odds-style formula:
+This step was reworked to make the gates **self-calibrating** and the clustering a **genuine multicut**. Three ideas do the work.
 
-  ```
-  c(i, j) = α · (ρ − d)
-  ```
+**(a) Robust, data-driven gates — `median + c·MAD`.** Instead of hard-coding radii from the known noise level, the gates are estimated from the point cloud itself. Two distance samples are collected with `scipy.spatial.cKDTree(pos, boxsize=L)` (periodic / torus nearest-neighbour queries that agree with `torus_distance`, without ever forming the full n×n matrix):
 
-  Points much closer than the gate get strongly positive costs (join), points near the gate boundary get costs near zero. Because gating already removes every pair with `d ≥ ρ`, **all retained edge costs are positive** — the "cut" signal is expressed by _absence_ of an edge rather than a negative cost.
+- `d_s` — each point's nearest-neighbour distance _within its own frame_ (mixes the tight internal object scale with the loose noise scale);
+- `d_m` — each point's nearest-neighbour distance _to the next frame_ (an estimate of per-step displacement).
 
-- Everything is assembled into a `TrackingInstance` (points, times, edges, costs, edge kind, node/frame counts). Total: **~145,000 edges** at defaults.
+A radius is then `ρ = median(sample) + c · MAD(sample)` (MAD = median absolute deviation). Why median/MAD and not mean/std: the background injects a minority of very large distances that **inflate the standard deviation**, so an old-style `k·std` gate _grows with the noise_ — which is exactly why the previous fixed-σ gate collapsed at high noise. The median and MAD ignore that outlier minority, so the gate stays anchored to the true object scale. The gates are also **scale-equivariant**: rescale the whole cloud by λ and both radii rescale by λ on their own — nothing absolute to re-tune.
+
+**(b) Two radii per axis — a gate radius and a cost radius.** This is what turns the graph into a real minimum-cost multicut:
+
+- `ρ_gate = med + c_gate·MAD` (default `c_gate = 3`) decides which pairs _become edges at all_ — kept generous so no true edge is dropped (recall).
+- `ρ_cost = med + c_cost·MAD` (default `c_cost = 2`) is the **zero-crossing** of the cost. Each edge cost is `c(i, j) = α · (ρ_cost − d)`.
+
+Because `c_cost < c_gate`, every pair with `ρ_cost < d < ρ_gate` is _inside_ the gate but _beyond_ the cost zero-crossing, so it carries a **negative** cost. The instance therefore contains genuine repulsive edges (≈ 22–27 % of all edges at defaults), and GAEC solves an actual multicut rather than degenerating to connected components. An assertion enforces `c_cost ≤ c_gate` (otherwise the gate would clip the negative edges and the old degenerate behaviour would return). Separate multipliers exist for the spatial and motion axes (`c_gate_spatial/motion`, `c_cost_spatial/motion`).
+
+**(c) DBSCAN-style noise pre-filter.** Before any edge is built, `core_point_mask` keeps a point only if it has at least `min_neighbors` neighbours within `ρ_gate_in` in its own frame (default `min_neighbors = 3`). An isolated clutter point can only ever form spurious "bridge" edges between real objects, so it is excluded from the graph _before_ the greedy solver can merge through it. At defaults this drops ≈ 3,000 of the 7,800 points — essentially the entire uniform background — which removes the spacetime-percolation failure path. Filtered points are **not deleted**: they remain in the dataset as singleton clusters, so the predicted-label array stays aligned with ground truth for VI.
+
+**Resulting graph (default config):** ~7,800 nodes; ~32.8k within-frame edges and ~79.3k between-frame edges (~1.1×10⁵ total). Between-frame edges include **cyclic wrap edges** between the last and first frame, so the spacetime domain (x, y, t) is a 3-torus. Everything is assembled into a `TrackingInstance` (points, times, edges, signed costs, per-edge kind, node/frame counts).
 
 ### Step 3 — Solver (`solver.py`)
 
@@ -153,11 +156,11 @@ All parameters live in one dataclass:
   3. Repeatedly pop the highest-value pair; if still valid and positive, contract the two clusters and merge their cost tables.
   4. Stop when no positive join remains.
 
-  Complexity **O(E log E)** — the full 145k-edge instance solves in a single pass with no decomposition.
+  Because the instance now carries both positive and negative edges (positive fraction ≈ 73–78 % at defaults), this is a real greedy multicut: contracting a pair can turn a previously-positive join negative once repulsive edges are folded in, so the solver stops short of merging everything. Complexity **O(E log E)** — the full ~1.1×10⁵-edge instance solves in a single pass with no decomposition.
 
-- **Background handling:** most clutter points survive gating with no edges at all and naturally end up as singleton clusters — no special-case logic needed.
+- **Background handling:** clutter that survives the pre-filter usually has no strong edges and naturally ends up as singleton clusters — no special-case logic needed.
 - **`greedy_solve(instance)`** wraps `gaec` and prints a run summary.
-- **`variation_of_information(labels_true, labels_pred)`** computes VI from a contingency table: `VI = H(true) + H(pred) − 2·I(true; pred)`, in nats. VI = 0 means identical partitions; lower is better.
+- **`variation_of_information(labels_true, labels_pred)`** computes VI from a contingency table: `VI = H(true) + H(pred) − 2·I(true; pred)`, in nats. VI = 0 means identical partitions; lower is better. VI is reported **inliers-only** (restricted to ground-truth label ≥ 0).
 
 ### Step 4 — Evaluation
 
@@ -167,16 +170,23 @@ Experiment harness sweeps **2 motion models × 4 observation-noise levels (0.05,
 
 ## 6. Results
 
-| σ_obs | outcome                                                                                                   |
-| ----- | --------------------------------------------------------------------------------------------------------- |
-| 0.05  | **VI = 0.0** — perfect recovery of all four tracks (both motion models)                                   |
-| 0.10  | VI ≈ 0.0 — essentially perfect                                                                            |
-| 0.20  | partial failure — tracks begin to fragment/merge                                                          |
-| 0.40  | **collapse: VI ≈ ln(4) ≈ 1.386** — auto-scaled gates grow so large that all points merge into one cluster |
+Mean **inliers-only VI** over seeds {0, 1, 2} at the default configuration, with the new data-driven gates:
 
-The collapse value is an analytic anchor: merging everything into a single cluster against a balanced 4-way ground truth yields exactly `VI = ln 4`, which the sweep reproduces — a strong sanity check on both the pipeline and the metric implementation.
+| σ_obs | mean VI (nats) | behaviour                                                                |
+| ----- | -------------- | ------------------------------------------------------------------------ |
+| 0.05  | **≈ 0.09**     | tracks recovered; mild over-segmentation into a few low-mass fragments   |
+| 0.10  | **≈ 0.18**     | still essentially correct, a little more fragmentation                   |
+| 0.20  | **≈ 0.38**     | fragmentation grows smoothly                                             |
+| 0.40  | **≈ 1.51**     | heavy fragmentation (hundreds of clusters), VI just past the ln 4 anchor |
 
-**Known limitation:** ~3.4% of within-frame edges connect points from different spheres or background (mean cost 0.13 vs. 0.228 for true same-sphere edges). At low noise GAEC's greedy ordering absorbs the strong true edges first, so these weak spurious edges rarely cause errors; at high noise they contribute to collapse.
+**Degradation is now smooth and monotone — the catastrophic collapse is gone.** Two things changed relative to the earlier fixed-gate design:
+
+- The old pipeline snapped to a single merged cluster at high noise, hitting the analytic ceiling `VI = ln 4 ≈ 1.386` (a balanced 4-way ground truth collapsed into one cluster). The robust gates no longer inflate with noise and the pre-filter removes the clutter bridges, so **that all-merge collapse no longer happens**.
+- The new residual error is the _opposite_ regime — **over-segmentation**. Even at σ = 0.05 the solver splits each track into a handful of pieces (tens of predicted clusters vs. 4 true), but those extra clusters carry little probability mass, so VI stays near zero. At σ = 0.40 the error is fragmentation into hundreds of clusters, which is why VI slightly _exceeds_ ln 4 (that anchor describes the merge regime, not this split regime).
+
+**Trade-off, stated honestly:** the pipeline no longer reaches exactly VI = 0 at low noise (the previous design did), but it degrades gracefully instead of collapsing, and it never merges distinct objects into one track.
+
+_(Numbers above were produced by re-running the sweep against the current `build_instance`. Regenerate them if you retune `c_gate`, `c_cost`, or `min_neighbors`.)_
 
 ---
 
@@ -185,9 +195,9 @@ The collapse value is an analytic anchor: merging everything into a single clust
 Report-grade figures used in the final talk:
 
 - **Noise-degradation curve** — VI (and ARI/NMI) vs. σ_obs, one line per motion model, seed-based error bands.
-- **Contingency heatmap** — true sphere labels vs. predicted clusters.
+- **Contingency heatmap** — true sphere labels vs. predicted clusters (inliers only).
 - **Before/after panel** — raw noisy detections vs. points colored by recovered track with start/end markers.
-- **Edge-cost histograms** — same-sphere vs. cross-sphere edge cost distributions.
+- **Edge-cost histograms** — same-sphere vs. cross-sphere edge cost distributions (now showing the negative tail).
 - **Collapse small-multiples** — predictions at low/mid/high noise side by side.
 - **Gated-graph frame view** — nodes and gated edges of `G_t`, `G_{t+1}` and the between-frame edge set.
 - **Scalability plot** — runtime vs. |E|, with the reference ILP's decomposition ceiling marked.
@@ -198,19 +208,22 @@ Deliberately **not** included: interpolated "recovered trajectory" lines (GAEC c
 
 ## 8. Design decisions
 
-**GAEC instead of ILP (Gurobi).** With Prof. Andres's approval, the two-person team scope replaces the exact minimum-cost-multicut ILP with the GAEC heuristic. This turned out to be a substantive strength, not just a simplification: the reference Gurobi setup was limited by its trial license to sub-200-variable subproblems and had to decompose the instance, weakening any global-optimality claim. GAEC processes the full ~7,800-node / ~145k-edge graph **natively in one pass**, and at realistic noise levels reaches VI = 0 anyway.
+**GAEC instead of ILP (Gurobi).** With Prof. Andres's approval, the two-person team scope replaces the exact minimum-cost-multicut ILP with the GAEC heuristic. This turned out to be a substantive strength, not just a simplification: the reference Gurobi setup was limited by its trial license to sub-200-variable subproblems and had to decompose the instance, weakening any global-optimality claim. GAEC processes the full ~7,800-node / ~10⁵-edge graph **natively in one pass**.
 
-**Unified single-pass clustering.** An earlier two-stage design (cluster per frame, then link clusters across frames) was replaced by one GAEC over all edges simultaneously, matching the updated project guide and removing an artificial stage boundary.
+**Robust, self-calibrating gates.** Radii are estimated as `median + c·MAD` of the observed nearest-neighbour distances rather than derived from the (in practice unknown) noise level. This is scale-equivariant and, crucially, does not inflate with background clutter — fixing the noise-driven gate growth that caused the earlier design to collapse at high σ.
 
-**Gating as implicit cut costs.** Filtering pairs with `d ≥ ρ` before cost computation keeps the edge set sparse and all costs positive; "do not join" is encoded by missing edges.
+**Two-radius gate/cost split → a genuine multicut.** A generous `ρ_gate` admits edges (recall) while a tighter `ρ_cost` sets the cost zero-crossing (precision). Pairs between the two thresholds carry negative cost, so the instance contains real repulsive edges and GAEC solves an actual multicut instead of returning connected components.
 
-**Auto-gates.** Defaults `ρ_in = 4σ_obs + 0.05` and `ρ_mot = v·dt + 4σ_obs + 0.1` tie the gates to the noise model and the maximum plausible per-frame displacement (adjustable in the Streamlit app).
+**Noise pre-filter as a percolation guard.** Excluding isolated points (DBSCAN core/noise logic) before edge construction removes the clutter "bridges" that used to let the greedy solver merge distinct objects, without deleting any point from the evaluation.
+
+**Unified single-pass clustering.** One GAEC over all edges simultaneously (within-frame and between-frame in the same pool), rather than an artificial cluster-per-frame-then-link two-stage design.
 
 ---
 
 ## 9. Reproducibility
 
-- Single-seed RNG (`np.random.default_rng(seed)`) flows through simulation and observation.
+- A single `seed` drives all randomness (simulation + observation) through `np.random.default_rng`.
+- Gate estimation is deterministic given the point cloud (`median + c·MAD`), so a fixed seed + fixed `c_gate`/`c_cost`/`min_neighbors` reproduces the exact instance.
 - Experiment sweeps run over fixed seed sets {0, 1, 2}.
 - Datasets round-trip via `save_dataset` / `load_dataset` (`.npz`, config included).
 
@@ -220,4 +233,4 @@ Deliberately **not** included: interpolated "recovered trajectory" lines (GAEC c
 
 - **Prof. Bjoern Andres** — supervision, project definition, scope-reduction approval.
 - **David Stein** — consulting throughout the project.
-- Course: _Machine Learning for Computer Vision_, TU Dresden. Final talks: July 14/21, 2026.
+- Course: _Machine Learning for Computer Vision_, TU Dresden. Final talks: July 21, 2026.
