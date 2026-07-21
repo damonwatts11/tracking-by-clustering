@@ -1,4 +1,17 @@
+# Tracking-by-Clustering — runtime dependencies
+# Install with:  pip install -r requirements.txt
+# Python >= 3.10
+
+# --- core numerics ---
 numpy>=1.26
-plotly>=5.20
+scipy>=1.11          # torus-aware nearest-neighbour gating (scipy.spatial.cKDTree)
+
+# --- visualisation ---
+plotly>=5.20         # all report figures + the Streamlit views
+
+# --- interactive explorer ---
+streamlit>=1.30      # app.py
+
+# --- notebook walkthrough ---
 jupyter>=1.0
 ipykernel>=6.29
