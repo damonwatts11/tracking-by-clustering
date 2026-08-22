@@ -1,17 +1,15 @@
-# Tracking-by-Clustering — runtime dependencies
-# Install with:  pip install -r requirements.txt
-# Python >= 3.10
+# Tracking-by-Clustering (TBC): runtime dependencies
+# Python >= 3.10 required (PEP 604 syntax `int | None` in tbc/instance.py)
 
-# --- core numerics ---
+# core numerics
 numpy>=1.26
-scipy>=1.11          # torus-aware nearest-neighbour gating (scipy.spatial.cKDTree)
+scipy>=1.11          # cKDTree(boxsize=L) for periodic nearest-neighbour queries
 
-# --- visualisation ---
-plotly>=5.20         # all report figures + the Streamlit views
+# interactive explorer and figures
+streamlit>=1.49      # app.py; st.toggle and plotly_chart(width="stretch")
+plotly>=5.20         # tbc/viz.py, tbc/viz_report.py
 
-# --- interactive explorer ---
-streamlit>=1.30      # app.py
-
-# --- notebook walkthrough ---
+# notebook harness (test_suite.ipynb)
 jupyter>=1.0
 ipykernel>=6.29
+matplotlib>=3.8      # sweep plots in the notebook
