@@ -61,12 +61,12 @@ def mad(x: np.ndarray) -> float:
     """
     Median Absolute Deviation:  MAD(x) = med(|x_i - med(x)|).
 
-    Análogo robusto de la desviación estándar: la std usa sumas sobre
-    todos los datos, así que las distancias enormes que introduce el
-    background noise la inflan; la mediana solo mira el dato central
-    del ordenamiento, así que el ruido (mientras sea minoría de la
-    muestra) no la mueve. Este es el motivo por el que el gate fijo
-    "k*std" colapsaba al subir el ruido: el umbral crecía con el ruido.
+    A robust analogue of the standard deviation: the std sums over all
+    the data, so the very large distances introduced by background
+    noise inflate it; the median only looks at the central value of the
+    ordering, so noise (as long as it stays a minority of the sample)
+    does not move it. This is why the fixed "k*std" gate collapsed as
+    noise increased: the threshold grew together with the noise.
     """
     x = np.asarray(x, dtype=float)
     med = np.median(x)
@@ -74,25 +74,25 @@ def mad(x: np.ndarray) -> float:
 
 
 def robust_threshold(sample: np.ndarray, c: float) -> float:
-    """rho = med + c*MAD.  c es el único hiperparámetro (adimensional)."""
+    """rho = med + c*MAD.  c is the only hyperparameter (dimensionless)."""
     return float(np.median(sample) + c * mad(sample))
 
 
 # ----------------------------------------------------------------------
-# 2. Muestras de distancias a vecino más cercano (métrica del toro)
+# 2. Nearest-neighbour distance samples (torus metric)
 # ----------------------------------------------------------------------
-# cKDTree(pos, boxsize=L) construye el árbol con condiciones de frontera
-# periódicas: query() devuelve directamente distancias mínimas-imagen,
-# consistentes con tbc.geometry.torus_distance, sin materializar la
-# matriz n x n.  Requiere puntos en [0, L), garantizado por wrap().
+# cKDTree(pos, boxsize=L) builds the tree with periodic boundary
+# conditions: query() returns minimum-image distances directly,
+# consistent with tbc.geometry.torus_distance, without materialising the
+# n x n matrix.  Requires points in [0, L), guaranteed by wrap().
 
 def nn_distances_intra(points: np.ndarray, times: np.ndarray,
                        T: int, L: float) -> np.ndarray:
     """
-    d_intra(p) = distancia (en el toro) de cada punto a su vecino más
-    cercano DENTRO de su propio frame. Muestra agregada sobre los T
-    frames. Es la cantidad cuya distribución mezcla la escala interna
-    de los objetos (valores bajos) con la escala del ruido (altos).
+    d_intra(p) = distance (on the torus) from each point to its nearest
+    neighbour WITHIN its own frame. Sample aggregated over the T frames.
+    This is the quantity whose distribution mixes the internal scale of
+    the objects (low values) with the scale of the noise (high values).
     """
     out = []
     for node_ids in nodes_by_frame(times, T):
@@ -100,7 +100,7 @@ def nn_distances_intra(points: np.ndarray, times: np.ndarray,
             continue
         pos = points[node_ids]
         tree = cKDTree(pos, boxsize=L)
-        # k=2: el vecino más cercano de un punto es él mismo (dist 0)
+        # k=2: the nearest neighbour of a point is the point itself (dist 0)
         dists, _ = tree.query(pos, k=2)
         out.append(dists[:, 1])
     return np.concatenate(out) if out else np.array([])
@@ -109,15 +109,16 @@ def nn_distances_intra(points: np.ndarray, times: np.ndarray,
 def nn_distances_inter(points: np.ndarray, times: np.ndarray,
                        T: int, L: float) -> np.ndarray:
     """
-    d_inter(p) = distancia (en el toro) de cada punto del frame t a su
-    vecino más cercano en el frame t+1.  Estima el desplazamiento por
-    paso de tiempo.
+    d_inter(p) = distance (on the torus) from each point in frame t to
+    its nearest neighbour in frame t+1.  Estimates the displacement per
+    time step.
 
-    NOTA: solo pares FÍSICAMENTE consecutivos (t, t+1) con t <= T-2.
-    El par cíclico (T-1, 0) que usa el tracker NO entra en la muestra:
-    la simulación corre hacia adelante sin periodicidad temporal, así
-    que ese par no representa un desplazamiento de un paso y meterlo
-    contaminaría el estimador con distancias arbitrariamente grandes.
+    NOTE: only PHYSICALLY consecutive pairs (t, t+1) with t <= T-2.
+    The cyclic pair (T-1, 0) used by the tracker does NOT enter the
+    sample: the simulation runs forward without temporal periodicity,
+    so that pair does not represent a one-step displacement, and
+    including it would contaminate the estimator with arbitrarily large
+    distances.
     """
     frames = nodes_by_frame(times, T)
     out = []
@@ -132,7 +133,7 @@ def nn_distances_inter(points: np.ndarray, times: np.ndarray,
 
 
 # ----------------------------------------------------------------------
-# 3. Estimación de los gates
+# 3. Gate estimation
 # ----------------------------------------------------------------------
 
 def estimate_gates(points: np.ndarray, times: np.ndarray, T: int, L: float,
@@ -141,8 +142,8 @@ def estimate_gates(points: np.ndarray, times: np.ndarray, T: int, L: float,
     rho_s = med(D_s) + c_spatial * MAD(D_s)
     rho_m = med(D_m) + c_motion  * MAD(D_m)
 
-    Devuelve (rho_s, rho_m). Equivariantes por escala: si la nube se
-    reescala por lambda, ambos gates se reescalan por lambda solos.
+    Returns (rho_s, rho_m). Scale-equivariant: if the point cloud is
+    rescaled by lambda, both gates rescale by lambda on their own.
     """
     d_s = nn_distances_intra(points, times, T, L)
     d_m = nn_distances_inter(points, times, T, L)
@@ -151,32 +152,33 @@ def estimate_gates(points: np.ndarray, times: np.ndarray, T: int, L: float,
 
 def estimate_gates_from_dataset(ds, c_spatial: float = 3.0,
                                 c_motion: float = 3.0):
-    """Conveniencia: lee points/times/T/L directamente del SyntheticDataset."""
+    """Convenience: reads points/times/T/L directly from the SyntheticDataset."""
     return estimate_gates(ds.points, ds.times,
                           ds.config.n_timesteps, ds.config.cube_size,
                           c_spatial=c_spatial, c_motion=c_motion)
 
 
 # ----------------------------------------------------------------------
-# 4. Pre-filtro de ruido (opcional, recomendado con mucho background)
+# 4. Noise pre-filter (optional, recommended with heavy background)
 # ----------------------------------------------------------------------
 
 def core_point_mask(points: np.ndarray, times: np.ndarray, T: int, L: float,
                     rho_s: float, min_neighbors: int = 1) -> np.ndarray:
     """
-    Máscara booleana (M,): True si el punto tiene >= min_neighbors
-    vecinos a distancia <= rho_s en su propio frame.
+    Boolean mask (M,): True if the point has >= min_neighbors
+    neighbours at distance <= rho_s within its own frame.
 
-    Fundamento: un punto de objeto pertenece a un cluster denso (en tu
-    simulación, ~n_inliers_per_sphere companeros por frame), así que
-    tiene vecinos dentro del gate espacial. Un punto sin vecinos solo
-    puede aportar aristas espurias o quedar singleton: excluirlo del
-    grafo elimina los "puentes de ruido" entre objetos ANTES de que el
-    greedy pueda cometer el error (misma lógica core/noise de DBSCAN).
+    Rationale: a point belonging to an object sits in a dense cluster
+    (in this simulation, ~n_inliers_per_sphere companions per frame), so
+    it has neighbours inside the spatial gate. A point with no
+    neighbours can only contribute spurious edges or end up a singleton:
+    excluding it from the graph removes the "noise bridges" between
+    objects BEFORE the greedy solver can make the mistake (the same
+    core/noise logic as DBSCAN).
 
-    Los puntos filtrados NO se eliminan del dataset: solo se excluyen
-    de la construcción de aristas y quedan como singletons, de modo que
-    el array de labels sigue alineado con ds.labels para el VI.
+    Filtered points are NOT removed from the dataset: they are only
+    excluded from edge construction and remain singletons, so that the
+    labels array stays aligned with ds.labels for the VI.
     """
     mask = np.zeros(len(points), dtype=bool)
     for node_ids in nodes_by_frame(times, T):
@@ -184,7 +186,7 @@ def core_point_mask(points: np.ndarray, times: np.ndarray, T: int, L: float,
             continue
         pos = points[node_ids]
         tree = cKDTree(pos, boxsize=L)
-        # cuenta vecinos dentro de rho_s (excluyéndose a sí mismo)
+        # count neighbours within rho_s (excluding the point itself)
         counts = tree.query_ball_point(pos, r=rho_s, return_length=True) - 1
         mask[node_ids] = counts >= min_neighbors
     return mask
@@ -418,30 +420,31 @@ def build_instance(ds,
                             cyclic: bool = True,
                             verbose: bool = True) -> TrackingInstance:
     """
-    Igual que tbc.instance.build_instance, pero:
+    Assembles the full TrackingInstance. Unlike a fixed-radius
+    construction:
 
-      1) rho_gate y rho_cost se ESTIMAN de la data (med + c*MAD) en vez
-         de fijarse a mano;
-      2) rho_gate (c_gate_*) y rho_cost (c_cost_*) están SEPARADOS:
-           - el gate admite aristas hasta med + c_gate*MAD  (recall)
-           - el costo cruza cero en    med + c_cost*MAD     (precisión)
-         con c_cost < c_gate, de modo que existen aristas de costo
-         negativo y GAEC resuelve un multicut de verdad en lugar de
-         devolver componentes conexas;
-      3) opcionalmente excluye puntos de ruido del grafo (min_neighbors;
-         None para desactivar).
+      1) rho_gate and rho_cost are ESTIMATED from the data
+         (med + c*MAD) instead of being set by hand;
+      2) rho_gate (c_gate_*) and rho_cost (c_cost_*) are SEPARATE:
+           - the gate admits edges up to med + c_gate*MAD  (recall)
+           - the cost crosses zero at   med + c_cost*MAD   (precision)
+         with c_cost < c_gate, so that negative-cost edges exist and
+         GAEC solves a genuine multicut instead of returning connected
+         components;
+      3) optionally excludes noise points from the graph (min_neighbors;
+         None to disable).
 
-    Requisito: c_cost_* <= c_gate_* (si no, el gate recorta las aristas
-    negativas y volvemos al problema original).
+    Requirement: c_cost_* <= c_gate_* (otherwise the gate clips away the
+    negative edges and we are back to the original problem).
     """
     assert c_cost_spatial <= c_gate_spatial and c_cost_motion <= c_gate_motion, \
-        "c_cost debe ser <= c_gate: el gate debe admitir aristas de costo negativo"
+        "c_cost must be <= c_gate: the gate must admit negative-cost edges"
 
     T = ds.config.n_timesteps
     L = ds.config.cube_size
     points, times = ds.points, ds.times
 
-    # ---- 1) muestras d1 y los cuatro radios --------------------------
+    # ---- 1) d1 samples and the four radii -----------------------------
     d_s = nn_distances_intra(points, times, T, L)
     d_m = nn_distances_inter(points, times, T, L)
 
@@ -450,7 +453,7 @@ def build_instance(ds,
     rho_cost_in  = robust_threshold(d_s, c_cost_spatial)
     rho_cost_mot = robust_threshold(d_m, c_cost_motion)
 
-    # ---- 2) agrupar nodos por frame; pre-filtro de ruido opcional ----
+    # ---- 2) group nodes by frame; optional noise pre-filter -----------
     frames = nodes_by_frame(times, T)
     if min_neighbors is not None:
         mask = core_point_mask(points, times, T, L,
@@ -460,7 +463,7 @@ def build_instance(ds,
     else:
         n_filtered = 0
 
-    # ---- 3) aristas con el gate generoso, costos con el cero interno -
+    # ---- 3) edges from the generous gate, costs with the inner zero ---
     w_edges, w_dists = within_frame_edges(points, frames, rho_gate_in, L)
     w_costs = edge_costs(w_dists, rho_cost_in, alpha_in)
 
@@ -480,13 +483,13 @@ def build_instance(ds,
     if verbose:
         fp_w = (w_costs > 0).mean() if len(w_costs) else 0.0
         fp_b = (b_costs > 0).mean() if len(b_costs) else 0.0
-        print("===== build_instance_adaptive() summary =====")
+        print("===== build_instance() summary =====")
         print(f"rho_gate_in  = {rho_gate_in:.4f}   rho_cost_in  = {rho_cost_in:.4f}")
         print(f"rho_gate_mot = {rho_gate_mot:.4f}   rho_cost_mot = {rho_cost_mot:.4f}")
-        print(f"puntos excluidos por filtro de ruido : {n_filtered}")
+        print(f"points excluded by noise filter : {n_filtered}")
         print(f"|E_t| = {len(w_edges)}   |E_t,t+1| = {len(b_edges)}   |E| = {len(edges)}")
-        print(f"Fraccion positiva (within)  : {fp_w:.2%}   <- ya NO debe ser 100%")
-        print(f"Fraccion positiva (between) : {fp_b:.2%}")
+        print(f"Positive fraction (within)  : {fp_w:.2%}   <- should NOT be 100%")
+        print(f"Positive fraction (between) : {fp_b:.2%}")
         print("=============================================")
 
     return instance

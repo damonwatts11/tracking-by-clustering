@@ -56,7 +56,7 @@ def gaec(inst) -> np.ndarray:
     n, edges, costs = inst.n_nodes, inst.edges, inst.costs
     uf = UnionFind(n)
     join = defaultdict(float)
-    adj = defaultdict(set)                       # root -> vecinos (roots)
+    adj = defaultdict(set)                        # root -> neighbours (roots)
     for idx in range(len(edges)):
         i, j = int(edges[idx, 0]), int(edges[idx, 1])
         key = (min(i, j), max(i, j))
@@ -79,7 +79,7 @@ def gaec(inst) -> np.ndarray:
         new_root = uf.union(ra, rb)
         old_root = rb if new_root == ra else ra
         adj[new_root].discard(old_root); adj[old_root].discard(new_root)
-        for nb in adj.pop(old_root, ()):         # plegar SOLO vecinos de old_root
+        for nb in adj.pop(old_root, ()):         # fold ONLY neighbours of old_root
             k = (min(old_root, nb), max(old_root, nb))
             if k not in join: continue
             val = join.pop(k)
