@@ -19,8 +19,7 @@ import streamlit as st
 import plotly.graph_objects as go
 
 from tbc.synthesis import SimConfig, generate_dataset
-from tbc.instance import build_instance
-from tbc.gating import build_instance_adaptive, estimate_gates_from_dataset
+from tbc.instance import build_instance, estimate_gates_from_dataset
 from tbc.solver import greedy_solve
 from tbc.viz import COLORS, animate_world
 from tbc.viz_report import (partition_metrics, large_tracks, _circular_mean,
@@ -52,39 +51,17 @@ onoise = sb.select_slider("observation noise σ_obs",
 seed   = sb.number_input("seed", 0, 999, 0)
 
 sb.title("Instance (gates)")
-gate_mode = sb.radio(
-    "gate mode",
-    ["adaptive (med + c·MAD, data-driven)",
-     "formula (4σ — needs sim params)",
-     "manual sliders"],
-    index=0,
-    help="adaptive: gates estimated from the point cloud itself via robust "
-         "nearest-neighbour statistics — no simulation parameters needed, "
-         "so it also works on real (non-synthetic) clouds.")
-
-if gate_mode.startswith("adaptive"):
-    c_gate = sb.slider("c_gate (edge admission, recall)", 1.0, 6.0, 3.0, 0.5,
-                       help="ρ_gate = med + c_gate·MAD. Generous: the gate "
-                            "must not drop true edges.")
-    c_cost = sb.slider("c_cost (cost zero-crossing)", 0.0, 3.0, 0.5, 0.25,
-                       help="ρ_cost = med + c_cost·MAD. Edges with "
-                            "ρ_cost < d < ρ_gate get NEGATIVE cost "
-                            "(repulsive evidence for GAEC).")
-    min_nb = sb.slider("min neighbours (noise pre-filter)", 0, 8, 3,
-                       help="Points with fewer neighbours than this inside "
-                            "ρ_gate in their own frame are excluded from the "
-                            "graph (kept as singletons). 0 = off.")
-    c_cost = min(c_cost, c_gate)          # cost zero must lie inside the gate
-    gate_key = ("adaptive", c_gate, c_cost, min_nb)
-elif gate_mode.startswith("formula"):
-    rho_in  = 4 * onoise + 0.05
-    rho_mot = speed * dt + 4 * onoise + 0.1
-    sb.caption(f"ρ_in = {rho_in:.2f}   ρ_mot = {rho_mot:.2f}")
-    gate_key = ("fixed", rho_in, rho_mot)
-else:
-    rho_in  = sb.slider("ρ_in", 0.05, 2.0, float(4 * onoise + 0.05), 0.05)
-    rho_mot = sb.slider("ρ_mot", 0.05, 2.5, float(speed * dt + 4 * onoise + 0.1), 0.05)
-    gate_key = ("fixed", rho_in, rho_mot)
+c_gate = sb.slider("c_gate (edge admission, recall)", 1.0, 6.0, 3.0, 0.5,
+                   help="ρ_gate = med + c_gate·MAD. Generous: the gate must "
+                        "not drop true edges.")
+c_cost = sb.slider("c_cost (cost zero-crossing)", 0.0, 3.0, 2.0, 0.25,
+                   help="ρ_cost = med + c_cost·MAD. Edges with "
+                        "ρ_cost < d < ρ_gate get negative (repulsive) cost.")
+min_nb = sb.slider("min neighbours (noise pre-filter)", 0, 8, 3,
+                   help="Points with fewer neighbours inside ρ_gate in their "
+                        "own frame are excluded from the graph. 0 = off.")
+c_cost = min(c_cost, c_gate)
+gate_key = (c_gate, c_cost, min_nb)
 
 run_tracker = sb.toggle("run GAEC tracker", value=False)
 
@@ -103,19 +80,15 @@ def get_dataset(p):
                     obs_noise_std=on, seed=seed)
     return generate_dataset(cfg)
 
-
 @st.cache_data(show_spinner="building the instance graph ...")
 def get_instance(p, gkey):
     ds = get_dataset(p)
-    if gkey[0] == "adaptive":
-        _, cg, cc, mn = gkey
-        return build_instance_adaptive(
-            ds, c_gate_spatial=cg, c_gate_motion=cg,
-            c_cost_spatial=cc, c_cost_motion=cc,
-            min_neighbors=(mn if mn > 0 else None),
-            cyclic=False, verbose=False)
-    _, ri, rm = gkey
-    return build_instance(ds, ri, rm, cyclic=False, verbose=False)
+    cg, cc, mn = gkey
+    return build_instance(
+        ds, c_gate_spatial=cg, c_gate_motion=cg,
+        c_cost_spatial=cc, c_cost_motion=cc,
+        min_neighbors=(mn if mn > 0 else None),
+        cyclic=False, verbose=False)
 
 
 @st.cache_data(show_spinner="estimating gates from the cloud ...")
@@ -140,10 +113,8 @@ ds = get_dataset(params)
 inst = get_instance(params, gate_key)
 cfg = ds.config
 
-if gate_key[0] == "adaptive":
-    _rs, _rm = get_estimated_gates(params, gate_key[1])
-    sb.caption(f"estimated from data:  ρ_gate,in = {_rs:.3f}   "
-               f"ρ_gate,mot = {_rm:.3f}")
+_rs, _rm = get_estimated_gates(params, c_gate)
+sb.caption(f"estimated from data:  ρ_gate,in = {_rs:.3f}   ρ_gate,mot = {_rm:.3f}")
 
 # ------------------------------------------------------------------
 # Header
@@ -421,8 +392,7 @@ else:
 # 5 · Performance
 # ------------------------------------------------------------------
 st.header("5 · Performance")
-tab1, tab2, tab3, tab4 = st.tabs(["this run", "edge quality",
-                                  "noise sweep", "sensitivity (live)"])
+tab1, tab2, tab3 = st.tabs(["this run", "edge quality", "sensitivity (live)"])
 
 with tab1:
     if not run_tracker:
@@ -454,23 +424,8 @@ with tab2:
     st.plotly_chart(edge_cost_histograms(inst, ds.labels, kind=1),
                     width='stretch')
 
+
 with tab3:
-    import os
-    SWEEP = "data/sweep.npz"
-    if not os.path.exists(SWEEP):
-        st.info("No cached sweep found. Run the sweep cell in "
-                "presentation.ipynb once — it saves to data/sweep.npz, "
-                "and this tab will pick it up.")
-    else:
-        results = list(np.load(SWEEP, allow_pickle=True)["results"])
-        st.caption(f"Loaded {len(results)} cached runs from {SWEEP} "
-                   "(computed by the notebook harness — fixed config, "
-                   "not the sidebar settings).")
-        st.plotly_chart(noise_curve(results, metric="vi"), width='stretch')
-        st.plotly_chart(noise_curve(results, metric="runtime",
-                        title="Runtime vs observation noise"),
-                        width='stretch')
-with tab4:
     st.caption("Live mini-sweep at reduced size (T=20, 10 inliers/sphere, "
                "seeds 0–1) around your current sidebar settings. Fast and "
                "indicative — report-grade numbers come from the notebook "
@@ -500,17 +455,13 @@ with tab4:
                 kw[var] = v
                 c = SimConfig(**kw)
                 d = generate_dataset(c)
-                if gate_key[0] == "adaptive":
-                    _, cg_, cc_, mn_ = gate_key
-                    ins = build_instance_adaptive(
-                        d, c_gate_spatial=cg_, c_gate_motion=cg_,
-                        c_cost_spatial=cc_, c_cost_motion=cc_,
-                        min_neighbors=(mn_ if mn_ > 0 else None),
-                        cyclic=False, verbose=False)
-                else:
-                    ri = 4 * c.obs_noise_std + 0.05
-                    rm = c.speed * c.dt + 4 * c.obs_noise_std + 0.1
-                    ins = build_instance(d, ri, rm, cyclic=False, verbose=False)
+                cg_, cc_, mn_ = gate_key
+                ins = build_instance(
+                d, c_gate_spatial=cg_, c_gate_motion=cg_,
+                c_cost_spatial=cc_, c_cost_motion=cc_,
+                min_neighbors=(mn_ if mn_ > 0 else None),
+                cyclic=False, verbose=False)
+
                 t0 = time.perf_counter()
                 lab, _ = greedy_solve(ins)
                 rt_ = time.perf_counter() - t0
