@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import numpy as np
+from scipy.spatial import cKDTree
 from tbc.geometry import torus_distance
 
 
@@ -56,7 +57,139 @@ def nodes_by_frame(times: np.ndarray, T: int) -> list:
     """
     return [np.flatnonzero(times == t) for t in range(T)]
 
+def mad(x: np.ndarray) -> float:
+    """
+    Median Absolute Deviation:  MAD(x) = med(|x_i - med(x)|).
 
+    A robust analogue of the standard deviation: the std sums over all
+    the data, so the very large distances introduced by background
+    noise inflate it; the median only looks at the central value of the
+    ordering, so noise (as long as it stays a minority of the sample)
+    does not move it. This is why the fixed "k*std" gate collapsed as
+    noise increased: the threshold grew together with the noise.
+    """
+    x = np.asarray(x, dtype=float)
+    med = np.median(x)
+    return float(np.median(np.abs(x - med)))
+
+
+def robust_threshold(sample: np.ndarray, c: float) -> float:
+    """rho = med + c*MAD.  c is the only hyperparameter (dimensionless)."""
+    return float(np.median(sample) + c * mad(sample))
+
+
+# ----------------------------------------------------------------------
+# 2. Nearest-neighbour distance samples (torus metric)
+# ----------------------------------------------------------------------
+# cKDTree(pos, boxsize=L) builds the tree with periodic boundary
+# conditions: query() returns minimum-image distances directly,
+# consistent with tbc.geometry.torus_distance, without materialising the
+# n x n matrix.  Requires points in [0, L), guaranteed by wrap().
+
+def nn_distances_intra(points: np.ndarray, times: np.ndarray,
+                       T: int, L: float) -> np.ndarray:
+    """
+    d_intra(p) = distance (on the torus) from each point to its nearest
+    neighbour WITHIN its own frame. Sample aggregated over the T frames.
+    This is the quantity whose distribution mixes the internal scale of
+    the objects (low values) with the scale of the noise (high values).
+    """
+    out = []
+    for node_ids in nodes_by_frame(times, T):
+        if len(node_ids) < 2:
+            continue
+        pos = points[node_ids]
+        tree = cKDTree(pos, boxsize=L)
+        # k=2: the nearest neighbour of a point is the point itself (dist 0)
+        dists, _ = tree.query(pos, k=2)
+        out.append(dists[:, 1])
+    return np.concatenate(out) if out else np.array([])
+
+
+def nn_distances_inter(points: np.ndarray, times: np.ndarray,
+                       T: int, L: float) -> np.ndarray:
+    """
+    d_inter(p) = distance (on the torus) from each point in frame t to
+    its nearest neighbour in frame t+1.  Estimates the displacement per
+    time step.
+
+    NOTE: only PHYSICALLY consecutive pairs (t, t+1) with t <= T-2.
+    The cyclic pair (T-1, 0) used by the tracker does NOT enter the
+    sample: the simulation runs forward without temporal periodicity,
+    so that pair does not represent a one-step displacement, and
+    including it would contaminate the estimator with arbitrarily large
+    distances.
+    """
+    frames = nodes_by_frame(times, T)
+    out = []
+    for t in range(T - 1):
+        ids_t, ids_next = frames[t], frames[t + 1]
+        if len(ids_t) == 0 or len(ids_next) == 0:
+            continue
+        tree = cKDTree(points[ids_next], boxsize=L)
+        dists, _ = tree.query(points[ids_t], k=1)
+        out.append(dists)
+    return np.concatenate(out) if out else np.array([])
+
+
+# ----------------------------------------------------------------------
+# 3. Gate estimation
+# ----------------------------------------------------------------------
+
+def estimate_gates(points: np.ndarray, times: np.ndarray, T: int, L: float,
+                   c_spatial: float = 3.0, c_motion: float = 3.0):
+    """
+    rho_s = med(D_s) + c_spatial * MAD(D_s)
+    rho_m = med(D_m) + c_motion  * MAD(D_m)
+
+    Returns (rho_s, rho_m). Scale-equivariant: if the point cloud is
+    rescaled by lambda, both gates rescale by lambda on their own.
+    """
+    d_s = nn_distances_intra(points, times, T, L)
+    d_m = nn_distances_inter(points, times, T, L)
+    return robust_threshold(d_s, c_spatial), robust_threshold(d_m, c_motion)
+
+
+def estimate_gates_from_dataset(ds, c_spatial: float = 3.0,
+                                c_motion: float = 3.0):
+    """Convenience: reads points/times/T/L directly from the SyntheticDataset."""
+    return estimate_gates(ds.points, ds.times,
+                          ds.config.n_timesteps, ds.config.cube_size,
+                          c_spatial=c_spatial, c_motion=c_motion)
+
+
+# ----------------------------------------------------------------------
+# 4. Noise pre-filter (optional, recommended with heavy background)
+# ----------------------------------------------------------------------
+
+def core_point_mask(points: np.ndarray, times: np.ndarray, T: int, L: float,
+                    rho_s: float, min_neighbors: int = 1) -> np.ndarray:
+    """
+    Boolean mask (M,): True if the point has >= min_neighbors
+    neighbours at distance <= rho_s within its own frame.
+
+    Rationale: a point belonging to an object sits in a dense cluster
+    (in this simulation, ~n_inliers_per_sphere companions per frame), so
+    it has neighbours inside the spatial gate. A point with no
+    neighbours can only contribute spurious edges or end up a singleton:
+    excluding it from the graph removes the "noise bridges" between
+    objects BEFORE the greedy solver can make the mistake (the same
+    core/noise logic as DBSCAN).
+
+    Filtered points are NOT removed from the dataset: they are only
+    excluded from edge construction and remain singletons, so that the
+    labels array stays aligned with ds.labels for the VI.
+    """
+    mask = np.zeros(len(points), dtype=bool)
+    for node_ids in nodes_by_frame(times, T):
+        if len(node_ids) < 2:
+            continue
+        pos = points[node_ids]
+        tree = cKDTree(pos, boxsize=L)
+        # count neighbours within rho_s (excluding the point itself)
+        counts = tree.query_ball_point(pos, r=rho_s, return_length=True) - 1
+        mask[node_ids] = counts >= min_neighbors
+    return mask
 # =============================================================
 # Task 3 — Within-Frame Edges (Spatial Gating)
 # =============================================================
@@ -276,83 +409,88 @@ def edge_costs(d: np.ndarray, rho: float, alpha: float) -> np.ndarray:
 # Task 6 — Build Instance (Assemble + Sanity Check)
 # =============================================================
 
-def build_instance(ds, rho_in: float, rho_mot: float,
-                   alpha_in: float = 1.0, alpha_mot: float = 1.0,
-                   cyclic: bool = True, verbose: bool = True) -> TrackingInstance:
+def build_instance(ds,
+                            c_gate_spatial: float = 3.0,
+                            c_gate_motion: float = 3.0,
+                            c_cost_spatial: float = 2.0,
+                            c_cost_motion: float = 2.0,
+                            alpha_in: float = 1.0,
+                            alpha_mot: float = 1.0,
+                            min_neighbors: int | None = 3,
+                            cyclic: bool = True,
+                            verbose: bool = True) -> TrackingInstance:
     """
-    Build the full TrackingInstance graph from a SyntheticDataset.
+    Assembles the full TrackingInstance. Unlike a fixed-radius
+    construction:
 
-    This ties together Tasks 2-5:
-      1. Group nodes by frame
-      2. Build within-frame edges + costs
-      3. Build between-frame edges + costs
-      4. Combine everything into one TrackingInstance
-      5. Print a sanity-check summary
+      1) rho_gate and rho_cost are ESTIMATED from the data
+         (med + c*MAD) instead of being set by hand;
+      2) rho_gate (c_gate_*) and rho_cost (c_cost_*) are SEPARATE:
+           - the gate admits edges up to med + c_gate*MAD  (recall)
+           - the cost crosses zero at   med + c_cost*MAD   (precision)
+         with c_cost < c_gate, so that negative-cost edges exist and
+         GAEC solves a genuine multicut instead of returning connected
+         components;
+      3) optionally excludes noise points from the graph (min_neighbors;
+         None to disable).
 
-    Args:
-        ds        : SyntheticDataset (from Step 1)
-        rho_in    : spatial gate radius for within-frame edges
-        rho_mot   : motion gate radius for between-frame edges
-        alpha_in  : slope for within-frame edge costs (default 1.0)
-        alpha_mot : slope for between-frame edge costs (default 1.0)
-        cyclic    : whether to add the wrap-around frame pair (T-1, 0)
-        verbose   : if True, print sanity-check stats
-
-    Returns:
-        TrackingInstance ready for the Step 3 solver
+    Requirement: c_cost_* <= c_gate_* (otherwise the gate clips away the
+    negative edges and we are back to the original problem).
     """
+    assert c_cost_spatial <= c_gate_spatial and c_cost_motion <= c_gate_motion, \
+        "c_cost must be <= c_gate: the gate must admit negative-cost edges"
 
     T = ds.config.n_timesteps
     L = ds.config.cube_size
+    points, times = ds.points, ds.times
 
-    # ---- Step 1: group nodes by frame (Task 2) ----
-    frames = nodes_by_frame(ds.times, T)
+    # ---- 1) d1 samples and the four radii -----------------------------
+    d_s = nn_distances_intra(points, times, T, L)
+    d_m = nn_distances_inter(points, times, T, L)
 
-    # ---- Step 2: within-frame edges (Task 3) ----
-    within_edges, within_dists = within_frame_edges(ds.points, frames, rho_in, L)
-    within_costs = edge_costs(within_dists, rho_in, alpha_in)
-    within_kind = np.zeros(len(within_edges), dtype=int)   # 0 = within-frame
+    rho_gate_in  = robust_threshold(d_s, c_gate_spatial)
+    rho_gate_mot = robust_threshold(d_m, c_gate_motion)
+    rho_cost_in  = robust_threshold(d_s, c_cost_spatial)
+    rho_cost_mot = robust_threshold(d_m, c_cost_motion)
 
-    # ---- Step 3: between-frame edges (Task 4) ----
-    between_edges, between_dists = between_frame_edges(
-        ds.points, frames, rho_mot, L, T, cyclic=cyclic
-    )
-    between_costs = edge_costs(between_dists, rho_mot, alpha_mot)
-    between_kind = np.ones(len(between_edges), dtype=int)  # 1 = between-frame
+    # ---- 2) group nodes by frame; optional noise pre-filter -----------
+    frames = nodes_by_frame(times, T)
+    if min_neighbors is not None:
+        mask = core_point_mask(points, times, T, L,
+                               rho_gate_in, min_neighbors=min_neighbors)
+        frames = [ids[mask[ids]] for ids in frames]
+        n_filtered = int((~mask).sum())
+    else:
+        n_filtered = 0
 
-    # ---- Step 4: combine everything ----
-    edges = np.concatenate([within_edges, between_edges], axis=0)
-    costs = np.concatenate([within_costs, between_costs], axis=0)
-    kind  = np.concatenate([within_kind, between_kind], axis=0)
+    # ---- 3) edges from the generous gate, costs with the inner zero ---
+    w_edges, w_dists = within_frame_edges(points, frames, rho_gate_in, L)
+    w_costs = edge_costs(w_dists, rho_cost_in, alpha_in)
 
-    instance = TrackingInstance(
-        points=ds.points,
-        times=ds.times,
-        edges=edges,
-        costs=costs,
-        kind=kind,
-        n_nodes=len(ds.points),
-        T=T,
-    )
+    b_edges, b_dists = between_frame_edges(points, frames, rho_gate_mot,
+                                           L, T, cyclic=cyclic)
+    b_costs = edge_costs(b_dists, rho_cost_mot, alpha_mot)
 
-    # ---- Step 5: sanity check / summary ----
+    edges = np.concatenate([w_edges, b_edges], axis=0)
+    costs = np.concatenate([w_costs, b_costs], axis=0)
+    kind = np.concatenate([np.zeros(len(w_edges), dtype=int),
+                           np.ones(len(b_edges), dtype=int)])
+
+    instance = TrackingInstance(points=points, times=times, edges=edges,
+                                costs=costs, kind=kind,
+                                n_nodes=len(points), T=T)
+
     if verbose:
-        n_within = len(within_edges)
-        n_between = len(between_edges)
-        n_total = len(edges)
-
-        frac_pos_within = (within_costs > 0).mean() if n_within > 0 else 0.0
-        frac_pos_between = (between_costs > 0).mean() if n_between > 0 else 0.0
-
+        fp_w = (w_costs > 0).mean() if len(w_costs) else 0.0
+        fp_b = (b_costs > 0).mean() if len(b_costs) else 0.0
         print("===== build_instance() summary =====")
-        print(f"|V| (total nodes)           : {instance.n_nodes}")
-        print(f"|E_t| (within-frame edges)  : {n_within}")
-        print(f"|E_t,t+1| (between edges)   : {n_between}")
-        print(f"|E| (total edges)           : {n_total}")
-        print(f"Fraction positive (within)  : {frac_pos_within:.2%}")
-        print(f"Fraction positive (between) : {frac_pos_between:.2%}")
-        print(f"rho_in  = {rho_in:.4f}   alpha_in  = {alpha_in}")
-        print(f"rho_mot = {rho_mot:.4f}   alpha_mot = {alpha_mot}")
-        print("=====================================")
+        print(f"rho_gate_in  = {rho_gate_in:.4f}   rho_cost_in  = {rho_cost_in:.4f}")
+        print(f"rho_gate_mot = {rho_gate_mot:.4f}   rho_cost_mot = {rho_cost_mot:.4f}")
+        print(f"points excluded by noise filter : {n_filtered}")
+        print(f"|E_t| = {len(w_edges)}   |E_t,t+1| = {len(b_edges)}   |E| = {len(edges)}")
+        print(f"Positive fraction (within)  : {fp_w:.2%}   <- should NOT be 100%")
+        print(f"Positive fraction (between) : {fp_b:.2%}")
+        print("=============================================")
 
     return instance
+
